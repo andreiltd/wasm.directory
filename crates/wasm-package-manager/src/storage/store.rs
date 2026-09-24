@@ -17,7 +17,7 @@
 #![allow(clippy::items_after_statements)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Context;
@@ -27,10 +27,10 @@ use oci_client::{Reference, client::ImageData, manifest::OciImageManifest};
 #[cfg(test)]
 use sea_orm::ConnectOptions;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend,
-    EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    Statement, TransactionTrait,
-    sea_query::{Expr, OnConflict, SimpleExpr},
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, Database, DatabaseConnection,
+    DbBackend, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    Set, Statement, TransactionTrait,
+    sea_query::{Expr, LockBehavior, LockType, OnConflict, SimpleExpr},
 };
 use tracing::warn;
 
@@ -99,6 +99,20 @@ pub struct FetchTask {
     pub kind: FetchTaskKind,
     /// How many times this task has been attempted so far.
     pub attempts: i64,
+    /// Claim number taken when this task was dequeued. Completing or
+    /// failing the task only takes effect while the row still carries it.
+    pub claim: i64,
+}
+
+/// Tags of a single repository that the indexer has already seen.
+///
+/// Returned by [`Store::known_tags`].
+#[derive(Debug, Default)]
+pub(crate) struct KnownTags {
+    /// Tags with a `pull` row in the fetch queue, in any status.
+    pub(crate) queued: HashSet<String>,
+    /// Tags whose manifest has at least one stored layer.
+    pub(crate) cached: HashSet<String>,
 }
 
 // -- Internal helpers ----------------------------------------------------
@@ -147,7 +161,7 @@ async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> anyhow::Result<()> {
 /// This value was generated once from the ASCII bytes `b"cmpmigr!"` interpreted
 /// as a big-endian signed 64-bit integer. It is intentionally hardcoded and
 /// MUST NOT change, or different binaries could contend on different lock keys.
-const POSTGRES_MIGRATION_ADVISORY_LOCK_KEY: i64 = 7_164_506_197_438_460_449;
+pub(super) const POSTGRES_MIGRATION_ADVISORY_LOCK_KEY: i64 = 7_164_506_197_438_460_449;
 
 const POSTGRES_MIGRATION_SET_TIMEOUT_SQL: &str =
     "SET lock_timeout = '60s'; SET statement_timeout = '60s';";
@@ -1877,6 +1891,15 @@ async fn upsert_oci_repository_full(
     Ok(row.id)
 }
 
+/// Matches the `fetch_queue` row of `task` only while it is still the
+/// in-progress claim that `task` was dequeued with.
+fn still_claimed(task: &FetchTask) -> Condition {
+    Condition::all()
+        .add(fetch_queue::Column::Id.eq(task.id))
+        .add(fetch_queue::Column::Status.eq(fetch_queue::FetchStatus::InProgress))
+        .add(fetch_queue::Column::Claim.eq(task.claim))
+}
+
 /// Convert a `fetch_queue` row into the public `QueueTask` shape.
 fn into_queue_task(row: fetch_queue::Model) -> wasm_meta_registry_types::QueueTask {
     let task_str = match row.task {
@@ -1911,6 +1934,10 @@ fn into_queue_task(row: fetch_queue::Model) -> wasm_meta_registry_types::QueueTa
 pub(crate) struct Store {
     pub(crate) state_info: StateInfo,
     db: DatabaseConnection,
+    /// Connection settings, kept so auxiliary connections (e.g. the indexer
+    /// lease) can be opened against the same database. `None` for the
+    /// in-memory test store.
+    db_config: Option<super::db_config::DbConfig>,
 }
 
 impl Store {
@@ -1996,7 +2023,11 @@ impl Store {
             metadata_size,
         );
 
-        Ok(Self { state_info, db })
+        Ok(Self {
+            state_info,
+            db,
+            db_config: Some(cfg),
+        })
     }
 
     /// Build a Store backed by an in-memory SQLite database with all
@@ -2013,7 +2044,11 @@ impl Store {
         let migration_info = Migrations::snapshot(&db).await;
         let state_info =
             StateInfo::new_at(tmp.clone(), tmp.join("config.toml"), &migration_info, 0, 0);
-        Ok(Self { state_info, db })
+        Ok(Self {
+            state_info,
+            db,
+            db_config: None,
+        })
     }
 
     /// Test-only accessor for the underlying SeaORM database connection.
@@ -2042,12 +2077,34 @@ impl Store {
         let Some(metadata) = extract_wit_metadata(wasm_bytes) else {
             return;
         };
+        if let Err(e) = self
+            .store_wit_metadata(manifest_id, layer_id, wasm_bytes, &metadata)
+            .await
+        {
+            warn!(
+                "Failed to insert WIT package for manifest {}: {}",
+                manifest_id, e
+            );
+        }
+    }
+
+    /// Persist already-extracted WIT metadata for a layer.
+    ///
+    /// Fails only if the `wit_package` row itself can't be written; the
+    /// worlds, dependencies and component rows below it stay best-effort.
+    async fn store_wit_metadata(
+        &self,
+        manifest_id: i64,
+        layer_id: Option<i64>,
+        wasm_bytes: &[u8],
+        metadata: &WitMetadata,
+    ) -> anyhow::Result<()> {
         let Some(raw_name) = metadata.package_name.as_deref() else {
-            return;
+            return Ok(());
         };
         let (package_name, version) = split_package_version(raw_name);
 
-        let wit_package_id = match upsert_wit_package(
+        let wit_package_id = upsert_wit_package(
             &self.db,
             package_name,
             version,
@@ -2056,17 +2113,7 @@ impl Store {
             Some(manifest_id),
             layer_id,
         )
-        .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(
-                    "Failed to insert WIT package for manifest {}: {}",
-                    manifest_id, e
-                );
-                return;
-            }
-        };
+        .await?;
 
         let mut world_ids: HashMap<String, i64> = HashMap::new();
         for world in &metadata.worlds {
@@ -2133,7 +2180,7 @@ impl Store {
                 package_name,
                 version,
                 &world_ids,
-                &metadata,
+                metadata,
             )
             .await;
         }
@@ -2143,6 +2190,7 @@ impl Store {
         let _ = resolve_export_foreign_keys(&self.db, wit_package_id).await;
         let _ = resolve_dependency_foreign_keys(&self.db, wit_package_id).await;
         let _ = resolve_component_target_foreign_keys(&self.db, manifest_id).await;
+        Ok(())
     }
 
     /// Extract and persist a `wasm_component` row plus its `component_target`
@@ -2197,10 +2245,17 @@ impl Store {
         }
     }
 
+    /// Store a pulled image: manifest, tag, layers, and WIT metadata.
+    ///
+    /// With `repair`, an image whose layers are already stored has its WIT
+    /// metadata re-derived from the freshly downloaded bytes. Retried pulls
+    /// use this, since the previous attempt may have stopped between storing
+    /// the layers and extracting from them.
     pub(crate) async fn insert(
         &self,
         reference: &Reference,
         image: ImageData,
+        repair: bool,
     ) -> anyhow::Result<(
         InsertResult,
         Option<String>,
@@ -2319,13 +2374,74 @@ impl Store {
                 self.try_extract_wit_package(manifest_id, Some(layer_id), data)
                     .await;
             }
+        } else if repair {
+            self.repair_layer_metadata(manifest_id, &image.layers)
+                .await?;
         }
-        let manifest_id_opt = if result == InsertResult::Inserted {
+        let manifest_id_opt = if result == InsertResult::Inserted || repair {
             Some(manifest_id)
         } else {
             None
         };
         Ok((result, digest, manifest, manifest_id_opt))
+    }
+
+    /// Re-derive WIT metadata for a manifest whose layers are already
+    /// stored, from freshly downloaded layer bytes. Also rewrites the layers
+    /// into the local cache, which may have been lost with an old replica.
+    ///
+    /// Existing rows are only replaced once the new bytes have parsed into a
+    /// named WIT package (the only kind that gets stored), and a
+    /// failure to write the replacement is returned so the task is retried
+    /// rather than completed without metadata.
+    async fn repair_layer_metadata(
+        &self,
+        manifest_id: i64,
+        layers: &[oci_client::client::ImageLayer],
+    ) -> anyhow::Result<()> {
+        let stored = oci_layer::Entity::find()
+            .filter(oci_layer::Column::OciManifestId.eq(manifest_id))
+            .all(&self.db)
+            .await?;
+        let cache = self.state_info.store_dir();
+        let mut extracted = Vec::new();
+        for (idx, layer) in layers.iter().enumerate() {
+            let position = i64::from(crate::convert::index_to_i32(idx)?);
+            let Some(row) = stored.iter().find(|l| l.position == position) else {
+                continue;
+            };
+            cacache::write(&cache, &row.digest, &layer.data).await?;
+            if let Some(metadata) = extract_wit_metadata(&layer.data)
+                && metadata.package_name.is_some()
+            {
+                extracted.push((row.id, layer, metadata));
+            }
+        }
+        if extracted.is_empty() {
+            return Ok(());
+        }
+        self.clear_wit_for_manifest(manifest_id).await?;
+        for (layer_id, layer, metadata) in &extracted {
+            self.store_wit_metadata(manifest_id, Some(*layer_id), &layer.data, metadata)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Delete the WIT package and component rows derived from a manifest,
+    /// ahead of extracting them again.
+    async fn clear_wit_for_manifest(&self, manifest_id: i64) -> anyhow::Result<()> {
+        let txn = self.db.begin().await?;
+        wit_package::Entity::delete_many()
+            .filter(wit_package::Column::OciManifestId.eq(manifest_id))
+            .exec(&txn)
+            .await?;
+        wasm_component::Entity::delete_many()
+            .filter(wasm_component::Column::OciManifestId.eq(manifest_id))
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+        Ok(())
     }
 
     pub(crate) async fn insert_metadata(
@@ -2724,7 +2840,7 @@ impl Store {
             return Ok(false);
         }
 
-        let mut layer_digests: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut layer_digests: HashSet<String> = HashSet::new();
         let mut manifest_ids: Vec<i64> = Vec::new();
         for manifest in &manifests_to_delete {
             manifest_ids.push(manifest.id);
@@ -2743,8 +2859,7 @@ impl Store {
             .filter(oci_manifest::Column::OciRepositoryId.eq(repo_id))
             .all(&self.db)
             .await?;
-        let mut retained_digests: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut retained_digests: HashSet<String> = HashSet::new();
         for other in &all_manifests {
             if manifest_ids.contains(&other.id) {
                 continue;
@@ -2779,7 +2894,7 @@ impl Store {
         let pat = format!("%{query}%");
         let rows = oci_repository::Entity::find()
             .filter(
-                sea_orm::Condition::any()
+                Condition::any()
                     .add(oci_repository::Column::Registry.like(&pat))
                     .add(oci_repository::Column::Repository.like(&pat))
                     .add(oci_repository::Column::WitNamespace.like(&pat))
@@ -3054,6 +3169,95 @@ impl Store {
 
     // ---- Fetch queue --------------------------------------------------
 
+    /// Open a handle for electing the background indexer leader.
+    pub(crate) async fn indexer_lease(&self) -> anyhow::Result<super::IndexerLease> {
+        super::IndexerLease::connect(self.db_config.as_ref()).await
+    }
+
+    /// Return the tags of a repository that the indexer already knows about,
+    /// so discovery can skip them without per-tag round-trips.
+    ///
+    /// * `queued`: tags that have a `pull` row in `fetch_queue` (any status).
+    ///   Enqueueing these again would be a no-op, because `enqueue_pull`
+    ///   uses `ON CONFLICT DO NOTHING`.
+    /// * `cached`: tags that point at a manifest with at least one stored
+    ///   layer, i.e. tags that were pulled at some point.
+    pub(crate) async fn known_tags(
+        &self,
+        registry: &str,
+        repository: &str,
+    ) -> anyhow::Result<KnownTags> {
+        #[derive(FromQueryResult)]
+        struct TagRow {
+            tag: String,
+        }
+        let backend = self.db.get_database_backend();
+
+        let queued = fetch_queue::Entity::find()
+            .select_only()
+            .column(fetch_queue::Column::Tag)
+            .filter(fetch_queue::Column::Registry.eq(registry))
+            .filter(fetch_queue::Column::Repository.eq(repository))
+            .filter(fetch_queue::Column::Task.eq(fetch_queue::FetchTask::Pull))
+            .into_model::<TagRow>()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|r| r.tag)
+            .collect();
+
+        let sql = "\
+            SELECT DISTINCT t.tag AS tag FROM oci_tag t \
+            JOIN oci_repository r ON r.id = t.oci_repository_id \
+            JOIN oci_manifest m ON m.oci_repository_id = r.id \
+                                AND m.digest = t.manifest_digest \
+            JOIN oci_layer l ON l.oci_manifest_id = m.id \
+            WHERE r.registry = ? AND r.repository = ?";
+        let cached = TagRow::find_by_statement(Statement::from_sql_and_values(
+            backend,
+            bind_placeholders(backend, sql),
+            [registry.into(), repository.into()],
+        ))
+        .all(&self.db)
+        .await?
+        .into_iter()
+        .map(|r| r.tag)
+        .collect();
+
+        Ok(KnownTags { queued, cached })
+    }
+
+    /// Reset tasks stuck in `in_progress` back to `pending`.
+    ///
+    /// A task stays `in_progress` forever if the worker processing it was
+    /// killed (e.g. a replica restart). Only rows not touched for at least
+    /// `stale_after_secs` are reset, so a task a live worker is still
+    /// running isn't handed out twice. The cutoff uses the database clock,
+    /// which is also what stamps `updated_at`. Returns the number of rows
+    /// reset.
+    pub(crate) async fn reset_stale_in_progress_tasks(
+        &self,
+        stale_after_secs: u64,
+    ) -> anyhow::Result<u64> {
+        // `stale_after_secs` is an integer, so interpolating it is safe.
+        let cutoff = match self.db.get_database_backend() {
+            DbBackend::Postgres => {
+                format!("updated_at < now() - interval '{stale_after_secs} seconds'")
+            }
+            _ => format!("updated_at < datetime('now', '-{stale_after_secs} seconds')"),
+        };
+        let result = fetch_queue::Entity::update_many()
+            .col_expr(
+                fetch_queue::Column::Status,
+                Expr::value(fetch_queue::FetchStatus::Pending),
+            )
+            .filter(fetch_queue::Column::Status.eq(fetch_queue::FetchStatus::InProgress))
+            .filter(Expr::cust(cutoff))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
     pub(crate) async fn enqueue_pull(
         &self,
         registry: &str,
@@ -3228,15 +3432,15 @@ impl Store {
 
     pub(crate) async fn dequeue_next(&self) -> anyhow::Result<Option<FetchTask>> {
         // Atomic claim: SELECT one pending row, mark it in_progress, return it.
-        // Wrap in a transaction so concurrent dequeues don't double-claim.
-        // SQLite serializes writes anyway; on Postgres this would benefit from
-        // FOR UPDATE SKIP LOCKED, which we can add later if multi-worker
-        // contention becomes an issue.
+        // On Postgres, `FOR UPDATE SKIP LOCKED` keeps concurrent workers (e.g.
+        // two replicas during a leader hand-over) from claiming the same row.
+        // SQLite serializes writes and ignores the lock clause.
         let txn = self.db.begin().await?;
         let candidate = fetch_queue::Entity::find()
             .filter(fetch_queue::Column::Status.eq(fetch_queue::FetchStatus::Pending))
             .order_by_asc(fetch_queue::Column::Priority)
             .order_by_asc(fetch_queue::Column::CreatedAt)
+            .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
             .one(&txn)
             .await?;
         let Some(row) = candidate else {
@@ -3250,15 +3454,22 @@ impl Store {
             tag: row.tag.clone(),
             kind: FetchTaskKind::from(row.task),
             attempts: i64::from(row.attempts),
+            claim: row.claim + 1,
         };
         let mut am: fetch_queue::ActiveModel = row.into();
         am.status = Set(fetch_queue::FetchStatus::InProgress);
+        am.claim = Set(task.claim);
         am.update(&txn).await?;
         txn.commit().await?;
         Ok(Some(task))
     }
 
-    pub(crate) async fn complete_task(&self, task_id: i64) -> anyhow::Result<()> {
+    /// Mark a claimed task as completed.
+    ///
+    /// Does nothing if the task was recovered and claimed again (or reset
+    /// by a refetch) since `task` was dequeued, so a stale worker can't
+    /// overwrite a newer result.
+    pub(crate) async fn complete_task(&self, task: &FetchTask) -> anyhow::Result<()> {
         fetch_queue::Entity::update_many()
             .col_expr(
                 fetch_queue::Column::Status,
@@ -3268,18 +3479,26 @@ impl Store {
                 fetch_queue::Column::LastError,
                 SimpleExpr::Value(sea_orm::Value::String(None)),
             )
-            .filter(fetch_queue::Column::Id.eq(task_id))
+            .filter(still_claimed(task))
             .exec(&self.db)
             .await?;
         Ok(())
     }
 
-    pub(crate) async fn fail_task(&self, task_id: i64, error: &str) -> anyhow::Result<()> {
+    /// Record a failed attempt of a claimed task, requeueing it until it
+    /// runs out of attempts. Like [`Store::complete_task`], this does
+    /// nothing if the task has been claimed again since.
+    pub(crate) async fn fail_task(&self, task: &FetchTask, error: &str) -> anyhow::Result<()> {
         // Read-modify-write inside a transaction: SeaORM's update builder
         // doesn't ergonomically express `attempts = attempts + 1` together
         // with a CASE-derived status, so we fetch the row first.
         let txn = self.db.begin().await?;
-        if let Some(row) = fetch_queue::Entity::find_by_id(task_id).one(&txn).await? {
+        let row = fetch_queue::Entity::find()
+            .filter(still_claimed(task))
+            .lock(LockType::Update)
+            .one(&txn)
+            .await?;
+        if let Some(row) = row {
             let new_attempts = row.attempts + 1;
             let new_status = if new_attempts >= row.max_attempts {
                 fetch_queue::FetchStatus::Failed
@@ -3296,6 +3515,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn pending_count(&self) -> anyhow::Result<u64> {
         let n = fetch_queue::Entity::find()
             .filter(fetch_queue::Column::Status.eq(fetch_queue::FetchStatus::Pending))
@@ -3413,22 +3633,9 @@ impl Store {
         let store_dir = self.state_info.store_dir().to_path_buf();
         let bytes = cacache::read(&store_dir, &layer.digest).await?;
 
-        // Wrap the delete + re-extract in a transaction so a mid-flight
-        // failure leaves the previously-indexed WIT data intact.
-        let txn = self.db.begin().await?;
-        wit_package::Entity::delete_many()
-            .filter(wit_package::Column::OciManifestId.eq(manifest_id))
-            .exec(&txn)
-            .await?;
-        wasm_component::Entity::delete_many()
-            .filter(wasm_component::Column::OciManifestId.eq(manifest_id))
-            .exec(&txn)
-            .await?;
-        // Note: we extract via `self` (the outer connection), not the txn,
-        // so the helper's own writes still need to be folded into this txn.
-        // For simplicity we commit the deletes first; a follow-up could push
-        // the extraction into the same transaction.
-        txn.commit().await?;
+        // The deletes commit before extraction runs on the outer connection;
+        // a follow-up could fold both into one transaction.
+        self.clear_wit_for_manifest(manifest_id).await?;
         self.try_extract_wit_package(manifest_id, Some(layer.id), &bytes)
             .await;
         Ok(())
@@ -3683,7 +3890,7 @@ impl Store {
             .order_by_desc(wit_package::Column::Id)
             .all(&self.db)
             .await?;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             if let Some(v) = r.version
@@ -4054,7 +4261,7 @@ mod smoke_tests {
             .expect("task should dequeue");
         assert_eq!(task.tag, "1.0.0");
         assert_eq!(store.pending_count().await.unwrap(), 0);
-        store.complete_task(task.id).await.unwrap();
+        store.complete_task(&task).await.unwrap();
         let status = store.get_queue_status().await.unwrap();
         assert_eq!(status.completed, 1);
     }
@@ -4067,8 +4274,271 @@ mod smoke_tests {
             .await
             .unwrap();
         let task = store.dequeue_next().await.unwrap().unwrap();
-        store.fail_task(task.id, "oops").await.unwrap();
+        store.fail_task(&task, "oops").await.unwrap();
         assert_eq!(store.pending_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn known_tags_reports_queued_and_cached_tags() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (registry, repository) = ("ghcr.io", "user/repo");
+        let digest = "sha256:cached";
+        let repo_id =
+            upsert_oci_repository_full(store.db(), registry, repository, None, None, None)
+                .await
+                .unwrap();
+        let (manifest_id, _) = upsert_oci_manifest(
+            store.db(),
+            repo_id,
+            digest,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        insert_oci_layer(store.db(), manifest_id, "sha256:layer", None, Some(1), 0)
+            .await
+            .unwrap();
+        upsert_oci_tag(store.db(), repo_id, "1.0.0", digest)
+            .await
+            .unwrap();
+        // A tag whose manifest has no layers doesn't count as cached.
+        let (_, _) = upsert_oci_manifest(
+            store.db(),
+            repo_id,
+            "sha256:empty",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        upsert_oci_tag(store.db(), repo_id, "1.1.0", "sha256:empty")
+            .await
+            .unwrap();
+
+        store
+            .enqueue_pull(registry, repository, "2.0.0", 0)
+            .await
+            .unwrap();
+        let failed = {
+            store
+                .enqueue_pull(registry, repository, "2.1.0", 0)
+                .await
+                .unwrap();
+            store.dequeue_next().await.unwrap().unwrap()
+        };
+        for _ in 0..3 {
+            store.fail_task(&failed, "boom").await.unwrap();
+        }
+        // Reindex rows and other repositories are ignored.
+        store
+            .enqueue_reindex(registry, repository, "3.0.0")
+            .await
+            .unwrap();
+        store
+            .enqueue_pull(registry, "other/repo", "9.9.9", 0)
+            .await
+            .unwrap();
+
+        let known = store.known_tags(registry, repository).await.unwrap();
+        let mut queued: Vec<_> = known.queued.into_iter().collect();
+        queued.sort();
+        assert_eq!(queued, ["2.0.0", "2.1.0"]);
+        let cached: Vec<_> = known.cached.into_iter().collect();
+        assert_eq!(cached, ["1.0.0"]);
+    }
+
+    #[tokio::test]
+    async fn reset_stale_in_progress_tasks_requeues_only_orphans() {
+        let store = Store::open_in_memory().await.unwrap();
+        for tag in ["1.0.0", "2.0.0", "3.0.0", "4.0.0"] {
+            store
+                .enqueue_pull("ghcr.io", "user/repo", tag, 0)
+                .await
+                .unwrap();
+        }
+        let done = store.dequeue_next().await.unwrap().unwrap();
+        store.complete_task(&done).await.unwrap();
+        let orphan = store.dequeue_next().await.unwrap().unwrap();
+        let _live = store.dequeue_next().await.unwrap().unwrap();
+        // Backdate the orphan as if its worker died long ago. Changing
+        // `updated_at` explicitly keeps the SQLite trigger from firing.
+        store
+            .db()
+            .execute_unprepared(&format!(
+                "UPDATE fetch_queue SET updated_at = '2000-01-01 00:00:00' WHERE id = {}",
+                orphan.id
+            ))
+            .await
+            .unwrap();
+        assert_eq!(store.pending_count().await.unwrap(), 1);
+
+        assert_eq!(store.reset_stale_in_progress_tasks(900).await.unwrap(), 1);
+        assert_eq!(store.pending_count().await.unwrap(), 2);
+        let status = store.get_queue_status().await.unwrap();
+        assert_eq!(status.in_progress, 1, "the live task is left alone");
+        assert_eq!(status.completed, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_worker_cannot_overwrite_reclaimed_task() {
+        let store = Store::open_in_memory().await.unwrap();
+        store
+            .enqueue_pull("ghcr.io", "user/repo", "1.0.0", 0)
+            .await
+            .unwrap();
+        let stale = store.dequeue_next().await.unwrap().unwrap();
+        store
+            .db()
+            .execute_unprepared(&format!(
+                "UPDATE fetch_queue SET updated_at = '2000-01-01 00:00:00' WHERE id = {}",
+                stale.id
+            ))
+            .await
+            .unwrap();
+        assert_eq!(store.reset_stale_in_progress_tasks(900).await.unwrap(), 1);
+        let fresh = store.dequeue_next().await.unwrap().unwrap();
+        assert_eq!(fresh.id, stale.id);
+        assert_ne!(fresh.claim, stale.claim);
+
+        store.complete_task(&fresh).await.unwrap();
+        // The stale worker's late failure must not undo the newer result.
+        store.fail_task(&stale, "late failure").await.unwrap();
+        let status = store.get_queue_status().await.unwrap();
+        assert_eq!(status.completed, 1);
+        assert_eq!(status.pending, 0);
+
+        // Nor may a stale completion finish a task someone else now holds.
+        store
+            .enqueue_refetch("ghcr.io", "user/repo", "1.0.0", 0)
+            .await
+            .unwrap();
+        let newer = store.dequeue_next().await.unwrap().unwrap();
+        store.complete_task(&fresh).await.unwrap();
+        let status = store.get_queue_status().await.unwrap();
+        assert_eq!(status.in_progress, 1, "newer claim is untouched");
+        store.fail_task(&newer, "real failure").await.unwrap();
+        let status = store.get_queue_status().await.unwrap();
+        assert_eq!(status.pending, 1, "the current claim can still fail");
+    }
+
+    #[tokio::test]
+    async fn repair_restores_wit_lost_by_interrupted_pull() {
+        let store = Store::open_in_memory().await.unwrap();
+        let reference: Reference = "ghcr.io/user/repair:1.0.0".parse().unwrap();
+        let image = || {
+            let mut resolve = wit_parser::Resolve::default();
+            let pkg = resolve
+                .push_str("repair.wit", "package test:repair@1.0.0;\nworld hello {}\n")
+                .unwrap();
+            let bytes = wit_component::encode(&resolve, pkg).unwrap();
+            let media_type = "application/wasm".to_string();
+            let layer_desc = oci_client::manifest::OciDescriptor {
+                media_type: media_type.clone(),
+                digest: "sha256:repairlayer".into(),
+                size: i64::try_from(bytes.len()).unwrap(),
+                ..Default::default()
+            };
+            ImageData {
+                layers: vec![oci_client::client::ImageLayer::new(bytes, media_type, None)],
+                digest: Some("sha256:repairmanifest".into()),
+                config: oci_client::client::Config::new(Vec::new(), String::new(), None),
+                manifest: Some(OciImageManifest {
+                    layers: vec![layer_desc],
+                    ..Default::default()
+                }),
+            }
+        };
+        let wit_rows = |store: &Store| {
+            let db = store.db().clone();
+            async move { wit_package::Entity::find().count(&db).await.unwrap() }
+        };
+
+        store.insert(&reference, image(), false).await.unwrap();
+        assert_eq!(wit_rows(&store).await, 1);
+
+        // Simulate a worker that died after storing layers, before WIT.
+        wit_package::Entity::delete_many()
+            .exec(store.db())
+            .await
+            .unwrap();
+
+        store.insert(&reference, image(), false).await.unwrap();
+        assert_eq!(wit_rows(&store).await, 0, "a plain cache hit skips WIT");
+
+        let (result, _, _, manifest_id) = store.insert(&reference, image(), true).await.unwrap();
+        assert_eq!(result, InsertResult::AlreadyExists);
+        assert!(manifest_id.is_some(), "repair reports the manifest");
+        assert_eq!(wit_rows(&store).await, 1, "repair re-extracts WIT");
+
+        store.insert(&reference, image(), true).await.unwrap();
+        assert_eq!(wit_rows(&store).await, 1, "repair doesn't duplicate WIT");
+
+        let mut garbage = image();
+        garbage.layers[0].data = b"not wasm".to_vec().into();
+        store.insert(&reference, garbage, true).await.unwrap();
+        assert_eq!(
+            wit_rows(&store).await,
+            1,
+            "unparsable bytes don't erase existing WIT"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_indexer_lease_is_exclusive() {
+        let Ok(url) = std::env::var("COMPONENT_DATABASE_URL") else {
+            return;
+        };
+        let lower = url.to_ascii_lowercase();
+        if !(lower.starts_with("postgres:") || lower.starts_with("postgresql:")) {
+            return;
+        }
+        let data_dir = tempfile::tempdir().expect("create temp dir");
+        let store = Store::open_at(data_dir.path().to_path_buf())
+            .await
+            .expect("open postgres store");
+        let a = store.indexer_lease().await.expect("open lease A");
+        let b = store.indexer_lease().await.expect("open lease B");
+        assert!(a.try_hold().await.expect("lease A query"));
+        assert!(
+            a.try_hold().await.expect("lease A renew"),
+            "holder keeps it"
+        );
+        assert!(
+            !b.try_hold().await.expect("lease B query"),
+            "B is locked out"
+        );
+        // Renewals must not stack: a single unlock frees the lock.
+        assert!(a.unlock_once().await.expect("lease A unlock"));
+        assert!(
+            b.try_hold().await.expect("lease B after unlock"),
+            "B acquires after A's single unlock"
+        );
+        assert!(
+            !a.try_hold().await.expect("lease A requery"),
+            "A is now locked out"
+        );
+        drop(b);
+        // Dropping the pool closes the session asynchronously; poll briefly.
+        let mut acquired = false;
+        for _ in 0..50 {
+            if a.try_hold().await.expect("lease A retry") {
+                acquired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(acquired, "A takes over once B goes away");
     }
 
     #[tokio::test]
@@ -4242,6 +4712,51 @@ mod smoke_tests {
             .await
             .expect("open Postgres store");
         assert_commit_sha_filter(&store, "postgres.test.local", "regression/commit-sha").await;
+    }
+
+    #[tokio::test]
+    async fn fetch_queue_queries_run_postgres() {
+        let Ok(url) = std::env::var("COMPONENT_DATABASE_URL") else {
+            return;
+        };
+        let lower = url.to_ascii_lowercase();
+        if !(lower.starts_with("postgres:") || lower.starts_with("postgresql:")) {
+            return;
+        }
+        let data_dir = tempfile::tempdir().expect("create temp dir");
+        let store = Store::open_at(data_dir.path().to_path_buf())
+            .await
+            .expect("open Postgres store");
+        let (registry, repository) = ("postgres.test.local", "regression/fetch-queue");
+        // `enqueue_refetch` resets any row left over from an earlier run to
+        // `pending`, and the lowest possible priority puts it at the head of
+        // the queue even if the shared test database has other pending rows.
+        store
+            .enqueue_refetch(registry, repository, "1.0.0", i32::MIN)
+            .await
+            .expect("enqueue on Postgres");
+        let known = store
+            .known_tags(registry, repository)
+            .await
+            .expect("known_tags on Postgres");
+        assert!(known.queued.contains("1.0.0"));
+
+        let task = store
+            .dequeue_next()
+            .await
+            .expect("dequeue with SKIP LOCKED on Postgres")
+            .expect("task should dequeue");
+        assert_eq!(
+            (task.repository.as_str(), task.tag.as_str()),
+            (repository, "1.0.0")
+        );
+        store
+            .reset_stale_in_progress_tasks(0)
+            .await
+            .expect("reset in-progress on Postgres");
+        let task = store.dequeue_next().await.unwrap().expect("requeued task");
+        assert_eq!(task.tag, "1.0.0");
+        store.complete_task(&task).await.unwrap();
     }
 
     #[test]
